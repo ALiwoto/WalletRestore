@@ -3,7 +3,7 @@ package main
 import (
 	"bufio"
 	"crypto/ecdsa"
-	"encoding/hex"
+	"crypto/sha256"
 	"fmt"
 	"math/big"
 	"os"
@@ -26,13 +26,12 @@ func main() {
 	targetAddr, _ := reader.ReadString('\n')
 	targetAddr = strings.TrimSpace(targetAddr)
 
-	// If we have exactly 12 words, try that combination
 	if len(knownWords) == 12 {
 		mnemonic := strings.Join(knownWords, " ")
 		if address, ok := checkWallet(mnemonic, targetAddr); ok {
 			fmt.Printf("Found match!\nAddress: %s\nMnemonic: %s\n", address, mnemonic)
 		} else {
-			fmt.Println("No match found for these words.")
+			fmt.Printf("No match found.\nGenerated address: %s\n", address)
 		}
 	} else {
 		fmt.Printf("You provided %d words. Need exactly 12 words.\n", len(knownWords))
@@ -40,47 +39,29 @@ func main() {
 }
 
 func checkWallet(mnemonic, targetAddr string) (string, bool) {
-	// Generate seed from mnemonic
 	seed := bip39.NewSeed(mnemonic, "")
-
-	// Generate master key
 	masterKey, err := hdkeychain.NewMaster(seed, &chaincfg.MainNetParams)
 	if err != nil {
 		return "", false
 	}
 
-	// Derive purpose
-	purpose, err := masterKey.Derive(hdkeychain.HardenedKeyStart + 44)
-	if err != nil {
-		return "", false
+	path := []uint32{
+		uint32(0x8000002C), // Purpose 44'
+		uint32(0x800000C3), // Coin type 195'
+		uint32(0x80000000), // Account 0'
+		uint32(0),          // Change 0
+		uint32(0),          // Address index 0
 	}
 
-	// Derive coin type (195 for TRON)
-	coinType, err := purpose.Derive(hdkeychain.HardenedKeyStart + 195)
-	if err != nil {
-		return "", false
+	key := masterKey
+	for _, n := range path {
+		key, err = key.Derive(n)
+		if err != nil {
+			return "", false
+		}
 	}
 
-	// Derive account
-	account, err := coinType.Derive(hdkeychain.HardenedKeyStart + 0)
-	if err != nil {
-		return "", false
-	}
-
-	// Derive change
-	change, err := account.Derive(0)
-	if err != nil {
-		return "", false
-	}
-
-	// Derive address index
-	address, err := change.Derive(0)
-	if err != nil {
-		return "", false
-	}
-
-	// Get private key
-	privateKeyBytes, err := address.ECPrivKey()
+	privateKeyBytes, err := key.ECPrivKey()
 	if err != nil {
 		return "", false
 	}
@@ -88,10 +69,8 @@ func checkWallet(mnemonic, targetAddr string) (string, bool) {
 	privateKey := privateKeyBytes.ToECDSA()
 	publicKey := privateKey.Public().(*ecdsa.PublicKey)
 
-	// Generate TRON address
-	address41 := generateTronAddress(publicKey)
-
-	return address41, address41 == targetAddr
+	address := generateTronAddress(publicKey)
+	return address, address == targetAddr
 }
 
 func generateTronAddress(publicKey *ecdsa.PublicKey) string {
@@ -100,24 +79,32 @@ func generateTronAddress(publicKey *ecdsa.PublicKey) string {
 	address := hash[12:]
 
 	// Add prefix 41
-	addressHex := fmt.Sprintf("41%x", address)
+	addressBytes := append([]byte{0x41}, address...)
 
-	// Convert to base58
-	decoded, _ := hex.DecodeString(addressHex)
-	base58Address := Base58EncodeAddr(decoded)
+	// Double SHA256
+	h := sha256.New()
+	h.Write(addressBytes)
+	hash1 := h.Sum(nil)
 
-	return base58Address
+	h.Reset()
+	h.Write(hash1)
+	hash2 := h.Sum(nil)
+
+	// Append first 4 bytes of double-sha256 as checksum
+	addressBytes = append(addressBytes, hash2[:4]...)
+
+	return Base58Encode(addressBytes)
 }
 
-func Base58EncodeAddr(input []byte) string {
+func Base58Encode(input []byte) string {
 	const ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
-
-	var result []byte
 
 	x := new(big.Int).SetBytes(input)
 	base := big.NewInt(58)
 	zero := big.NewInt(0)
 	mod := &big.Int{}
+
+	var result []byte
 
 	for x.Cmp(zero) > 0 {
 		x.DivMod(x, base, mod)
