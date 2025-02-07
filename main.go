@@ -2,12 +2,18 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"crypto/ecdsa"
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"math/big"
 	"os"
+	"os/signal"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/btcsuite/btcd/chaincfg"
 	"github.com/btcsuite/btcutil/hdkeychain"
@@ -15,7 +21,33 @@ import (
 	"github.com/tyler-smith/go-bip39"
 )
 
+const (
+	MaxGoroutines        = 4 // Adjust based on your CPU
+	SaveInterval         = 10 * time.Second
+	AllPositionsAreKnown = true
+)
+
+type Progress struct {
+	LastIndex      int64    `json:"last_index"`
+	TestedCombos   int64    `json:"tested_combinations"`
+	KnownWords     []string `json:"known_words"`
+	KnownPositions []int    `json:"known_positions"`
+}
+
 func main() {
+	// Create context for graceful shutdown
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Handle Ctrl+C
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt)
+	go func() {
+		<-c
+		fmt.Println("\nShutting down gracefully...")
+		cancel()
+	}()
+
 	reader := bufio.NewReader(os.Stdin)
 
 	fmt.Println("Please write as many words as you have (space-separated):")
@@ -33,8 +65,130 @@ func main() {
 		} else {
 			fmt.Printf("No match found.\nGenerated address: %s\n", address)
 		}
-	} else {
-		fmt.Printf("You provided %d words. Need exactly 12 words.\n", len(knownWords))
+
+		return
+	}
+
+	fmt.Println("Entering brute-force mode!")
+
+	// Load BIP39 wordlist
+	wordlist := bip39.GetWordList()
+
+	// Load progress if exists
+	progress := loadProgress()
+	if progress == nil {
+		progress = &Progress{
+			LastIndex:      -1,
+			TestedCombos:   0,
+			KnownWords:     knownWords,
+			KnownPositions: make([]int, len(knownWords)),
+		}
+		// Fill known positions - you'll need to input these
+		fmt.Println("For each known word, enter its position (0-11):")
+		for i, word := range knownWords {
+			if AllPositionsAreKnown {
+				fmt.Println(
+					"We are assuming all positions are known. " +
+						"you can set AllPositionsAreKnown to false to make me ask you the positions.")
+				progress.KnownPositions[i] = i
+			} else {
+				fmt.Printf("Position for '%s': ", word)
+				var pos int
+				fmt.Scanf("%d", &pos)
+				progress.KnownPositions[i] = pos
+			}
+		}
+	}
+
+	// Create work channel and wait group
+	jobs := make(chan []string, MaxGoroutines)
+	var wg sync.WaitGroup
+
+	// Start workers
+	for i := 0; i < MaxGoroutines; i++ {
+		wg.Add(1)
+		go worker(ctx, jobs, &wg, targetAddr, progress)
+	}
+
+	// Start progress saver
+	go saveProgressPeriodically(ctx, progress)
+
+	// Generate and test combinations
+	missingCount := 12 - len(knownWords)
+	totalCombinations := pow(len(wordlist), missingCount)
+
+	fmt.Printf("Total combinations to test: %d\n", totalCombinations)
+	fmt.Printf("Estimated time: %v (at 1000 checks/sec)\n", time.Duration(totalCombinations/1000)*time.Second)
+
+	generateCombinations(ctx, wordlist, progress, jobs)
+
+	close(jobs)
+	wg.Wait()
+
+	fmt.Printf("\nTested %d combinations\n", atomic.LoadInt64(&progress.TestedCombos))
+}
+
+func worker(ctx context.Context, jobs <-chan []string, wg *sync.WaitGroup, targetAddr string, progress *Progress) {
+	defer wg.Add(-1)
+
+	for words := range jobs {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+			if address, ok := checkWallet(strings.Join(words, " "), targetAddr); ok {
+				fmt.Printf("\nFOUND MATCH!\nAddress: %s\nWords: %s\n", address, strings.Join(words, " "))
+				os.Exit(0)
+			}
+			atomic.AddInt64(&progress.TestedCombos, 1)
+		}
+	}
+}
+
+func generateCombinations(ctx context.Context, wordlist []string, progress *Progress, jobs chan<- []string) {
+	words := make([]string, 12)
+
+	// Fill known words
+	for i, word := range progress.KnownWords {
+		words[progress.KnownPositions[i]] = word
+	}
+
+	// Get positions that need to be filled
+	var missingPositions []int
+	for i := 0; i < 12; i++ {
+		if words[i] == "" {
+			missingPositions = append(missingPositions, i)
+		}
+	}
+
+	// Generate combinations
+	indices := make([]int, len(missingPositions))
+	startIndex := progress.LastIndex + 1
+
+	for i := startIndex; i < pow(len(wordlist), len(missingPositions)); i++ {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+			// Convert i to base-2048 for wordlist indices
+			num := i
+			for j := len(indices) - 1; j >= 0; j-- {
+				indices[j] = int(num) % len(wordlist)
+				num /= int64(len(wordlist))
+			}
+
+			// Fill missing positions with words
+			for j, pos := range missingPositions {
+				words[pos] = wordlist[indices[j]]
+			}
+
+			// Make copy of words slice
+			wordsCopy := make([]string, 12)
+			copy(wordsCopy, words)
+
+			jobs <- wordsCopy
+			atomic.StoreInt64(&progress.LastIndex, int64(i))
+		}
 	}
 }
 
@@ -126,4 +280,45 @@ func Base58Encode(input []byte) string {
 	}
 
 	return string(result)
+}
+
+func saveProgressPeriodically(ctx context.Context, progress *Progress) {
+	ticker := time.NewTicker(SaveInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			saveProgress(progress)
+			return
+		case <-ticker.C:
+			saveProgress(progress)
+			fmt.Printf("\rTested combinations: %d", atomic.LoadInt64(&progress.TestedCombos))
+		}
+	}
+}
+
+func saveProgress(progress *Progress) {
+	data, _ := json.Marshal(progress)
+	os.WriteFile("progress.json", data, 0644)
+}
+
+func loadProgress() *Progress {
+	data, err := os.ReadFile("progress.json")
+	if err != nil {
+		return nil
+	}
+	var progress Progress
+	if err := json.Unmarshal(data, &progress); err != nil {
+		return nil
+	}
+	return &progress
+}
+
+func pow(x, y int) int64 {
+	result := int64(1)
+	for i := 0; i < y; i++ {
+		result *= int64(x)
+	}
+	return result
 }
