@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/btcsuite/btcd/chaincfg"
+	"github.com/btcsuite/btcutil/base58"
 	"github.com/btcsuite/btcutil/hdkeychain"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/tyler-smith/go-bip39"
@@ -118,7 +119,7 @@ func main() {
 	totalCombinations := pow(len(wordlist), missingCount)
 
 	fmt.Printf("Total combinations to test: %d\n", totalCombinations)
-	fmt.Printf("Estimated time: %v (at 1000 checks/sec)\n", time.Duration(totalCombinations/1000)*time.Second)
+	fmt.Printf("Estimated time: %v (at 2000 checks/sec)\n", time.Duration(totalCombinations/2000)*time.Second)
 
 	generateCombinations(ctx, wordlist, progress, jobs)
 
@@ -136,9 +137,11 @@ func worker(ctx context.Context, jobs <-chan []string, wg *sync.WaitGroup, targe
 		case <-ctx.Done():
 			return
 		default:
-			if address, ok := checkWallet(strings.Join(words, " "), targetAddr); ok {
-				fmt.Printf("\nFOUND MATCH!\nAddress: %s\nWords: %s\n", address, strings.Join(words, " "))
-				os.Exit(0)
+			if !containsRepeated(words) {
+				if address, ok := checkWallet(strings.Join(words, " "), targetAddr); ok {
+					fmt.Printf("\nFOUND MATCH!\nAddress: %s\nWords: %s\n", address, strings.Join(words, " "))
+					os.Exit(0)
+				}
 			}
 			atomic.AddInt64(&progress.TestedCombos, 1)
 		}
@@ -164,8 +167,9 @@ func generateCombinations(ctx context.Context, wordlist []string, progress *Prog
 	// Generate combinations
 	indices := make([]int, len(missingPositions))
 	startIndex := progress.LastIndex + 1
+	maxTries := pow(len(wordlist), len(missingPositions))
 
-	for i := startIndex; i < pow(len(wordlist), len(missingPositions)); i++ {
+	for i := startIndex; i < maxTries; i++ {
 		select {
 		case <-ctx.Done():
 			return
@@ -192,11 +196,11 @@ func generateCombinations(ctx context.Context, wordlist []string, progress *Prog
 	}
 }
 
-func checkWallet(mnemonic, targetAddr string) (string, bool) {
-	seed := bip39.NewSeed(mnemonic, "")
+func CreateAddressFromSeeds(seeds string) string {
+	seed := bip39.NewSeed(seeds, "")
 	masterKey, err := hdkeychain.NewMaster(seed, &chaincfg.MainNetParams)
 	if err != nil {
-		return "", false
+		return ""
 	}
 
 	path := []uint32{
@@ -211,19 +215,23 @@ func checkWallet(mnemonic, targetAddr string) (string, bool) {
 	for _, n := range path {
 		key, err = key.Derive(n)
 		if err != nil {
-			return "", false
+			return ""
 		}
 	}
 
 	privateKeyBytes, err := key.ECPrivKey()
 	if err != nil {
-		return "", false
+		return ""
 	}
 
 	privateKey := privateKeyBytes.ToECDSA()
 	publicKey := privateKey.Public().(*ecdsa.PublicKey)
 
-	address := generateTronAddress(publicKey)
+	return generateTronAddress(publicKey)
+}
+
+func checkWallet(mnemonic, targetAddr string) (string, bool) {
+	address := CreateAddressFromSeeds(mnemonic)
 	return address, address == targetAddr
 }
 
@@ -251,6 +259,10 @@ func generateTronAddress(publicKey *ecdsa.PublicKey) string {
 }
 
 func Base58Encode(input []byte) string {
+	return base58.Encode(input)
+}
+
+func OldBase58Encode(input []byte) string {
 	const ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
 	x := new(big.Int).SetBytes(input)
@@ -321,4 +333,15 @@ func pow(x, y int) int64 {
 		result *= int64(x)
 	}
 	return result
+}
+
+func containsRepeated(words []string) bool {
+	wordMap := make(map[string]bool)
+	for _, word := range words {
+		if _, exists := wordMap[word]; exists {
+			return true
+		}
+		wordMap[word] = true
+	}
+	return false
 }
