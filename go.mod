@@ -3,6 +3,7 @@ module TronWalletAutomation
 go 1.23.4
 
 require (
+	github.com/ALiwoto/ssg v1.1.41-0.20250209170712-82de97eafae8
 	github.com/btcsuite/btcd v0.22.1
 	github.com/btcsuite/btcutil v1.0.3-0.20201208143702-a53e38424cce
 	github.com/ethereum/go-ethereum v1.12.2
@@ -16,4 +17,5 @@ require (
 	github.com/holiman/uint256 v1.2.3 // indirect
 	golang.org/x/crypto v0.9.0 // indirect
 	golang.org/x/sys v0.9.0 // indirect
+	golang.org/x/text v0.15.0 // indirect
 )

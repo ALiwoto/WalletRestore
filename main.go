@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/ALiwoto/ssg/ssg"
 	"github.com/btcsuite/btcd/chaincfg"
 	"github.com/btcsuite/btcutil/base58"
 	"github.com/btcsuite/btcutil/hdkeychain"
@@ -23,7 +24,6 @@ import (
 )
 
 const (
-	MaxGoroutines        = 4 // Adjust based on your CPU
 	SaveInterval         = 10 * time.Second
 	AllPositionsAreKnown = true
 )
@@ -35,7 +35,27 @@ type Progress struct {
 	KnownPositions []int    `json:"known_positions"`
 }
 
+var (
+	NoProgress    = false
+	MaxGoroutines = 4 // Adjust based on your CPU
+)
+
 func main() {
+	for _, currentArg := range os.Args {
+		if currentArg == "--no-progress" {
+			NoProgress = true
+		} else if strings.HasPrefix(currentArg, "--cores:") {
+			myStrs := strings.Split(currentArg, ":")
+			if len(myStrs) < 2 {
+				continue
+			}
+			myValue := ssg.ToInt(myStrs[1])
+			if myValue > 0 {
+				MaxGoroutines = myValue
+			}
+		}
+
+	}
 	// Create context for graceful shutdown
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -51,6 +71,7 @@ func main() {
 
 	reader := bufio.NewReader(os.Stdin)
 
+	fmt.Println("Using " + ssg.ToBase10(MaxGoroutines) + " Goroutines.")
 	fmt.Println("Please write as many words as you have (space-separated):")
 	knownWordsInput, _ := reader.ReadString('\n')
 	knownWords := strings.Fields(strings.TrimSpace(knownWordsInput))
@@ -311,6 +332,9 @@ func saveProgressPeriodically(ctx context.Context, progress *Progress) {
 }
 
 func saveProgress(progress *Progress) {
+	if NoProgress {
+		return
+	}
 	data, _ := json.Marshal(progress)
 	os.WriteFile("progress.json", data, 0644)
 }
