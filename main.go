@@ -2,12 +2,12 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
-	"math/big"
 	"os"
 	"os/signal"
 	"strings"
@@ -89,12 +89,14 @@ func main() {
 		return
 	}
 
+	decodedTargetAddress := base58.Decode(targetAddr)
+
 	if len(knownWords) == 12 {
 		mnemonic := strings.Join(knownWords, " ")
-		if address, ok := checkWallet(mnemonic, targetAddr); ok {
-			fmt.Printf("Found match!\nAddress: %s\nMnemonic: %s\n", address, mnemonic)
+		if address, ok := checkWallet(mnemonic, decodedTargetAddress); ok {
+			fmt.Printf("Found match!\nAddress: %s\nMnemonic: %s\n", base58.Encode(address), mnemonic)
 		} else {
-			fmt.Printf("No match found.\nGenerated address: %s\n", address)
+			fmt.Printf("No match found.\nGenerated address: %s\n", base58.Encode(address))
 		}
 
 		return
@@ -135,10 +137,12 @@ func main() {
 	jobs := make(chan []string, MaxGoroutines)
 	var wg sync.WaitGroup
 
+	fmt.Println("Start timestamp: " + ssg.ToBase10(time.Now().Unix()))
+
 	// Start workers
 	for i := 0; i < MaxGoroutines; i++ {
 		wg.Add(1)
-		go worker(ctx, jobs, &wg, targetAddr, progress)
+		go worker(ctx, jobs, &wg, decodedTargetAddress, progress)
 	}
 
 	// Start progress saver
@@ -157,9 +161,10 @@ func main() {
 	wg.Wait()
 
 	fmt.Printf("\nTested %d combinations\n", atomic.LoadInt64(&progress.TestedCombos))
+	fmt.Println("Finish timestamp: " + ssg.ToBase10(time.Now().Unix()))
 }
 
-func worker(ctx context.Context, jobs <-chan []string, wg *sync.WaitGroup, targetAddr string, progress *Progress) {
+func worker(ctx context.Context, jobs <-chan []string, wg *sync.WaitGroup, targetAddr []byte, progress *Progress) {
 	defer wg.Add(-1)
 
 	for words := range jobs {
@@ -169,7 +174,8 @@ func worker(ctx context.Context, jobs <-chan []string, wg *sync.WaitGroup, targe
 		default:
 			if !containsRepeated(words) {
 				if address, ok := checkWallet(strings.Join(words, " "), targetAddr); ok {
-					fmt.Printf("\nFOUND MATCH!\nAddress: %s\nWords: %s\n", address, strings.Join(words, " "))
+					fmt.Printf("\nFOUND MATCH!\nAddress: %s\nWords: %s\n", base58.Encode(address), strings.Join(words, " "))
+					fmt.Println("Finish timestamp: " + ssg.ToBase10(time.Now().Unix()))
 					os.Exit(0)
 				}
 			}
@@ -226,11 +232,11 @@ func generateCombinations(ctx context.Context, wordlist []string, progress *Prog
 	}
 }
 
-func CreateAddressFromSeeds(seeds string) string {
+func CreateAddressFromSeeds(seeds string) []byte {
 	seed := bip39.NewSeed(seeds, "")
 	masterKey, err := hdkeychain.NewMaster(seed, &chaincfg.MainNetParams)
 	if err != nil {
-		return ""
+		return nil
 	}
 
 	path := []uint32{
@@ -245,13 +251,13 @@ func CreateAddressFromSeeds(seeds string) string {
 	for _, n := range path {
 		key, err = key.Derive(n)
 		if err != nil {
-			return ""
+			return nil
 		}
 	}
 
 	privateKeyBytes, err := key.ECPrivKey()
 	if err != nil {
-		return ""
+		return nil
 	}
 
 	privateKey := privateKeyBytes.ToECDSA()
@@ -260,12 +266,13 @@ func CreateAddressFromSeeds(seeds string) string {
 	return generateTronAddress(publicKey)
 }
 
-func checkWallet(mnemonic, targetAddr string) (string, bool) {
+func checkWallet(mnemonic string, targetAddr []byte) ([]byte, bool) {
 	address := CreateAddressFromSeeds(mnemonic)
-	return address, address == targetAddr
+
+	return address, bytes.Equal(address, targetAddr)
 }
 
-func generateTronAddress(publicKey *ecdsa.PublicKey) string {
+func generateTronAddress(publicKey *ecdsa.PublicKey) []byte {
 	pub := crypto.FromECDSAPub(publicKey)
 	hash := crypto.Keccak256(pub[1:])
 	address := hash[12:]
@@ -285,43 +292,11 @@ func generateTronAddress(publicKey *ecdsa.PublicKey) string {
 	// Append first 4 bytes of double-sha256 as checksum
 	addressBytes = append(addressBytes, hash2[:4]...)
 
-	return Base58Encode(addressBytes)
+	return addressBytes
 }
 
 func Base58Encode(input []byte) string {
 	return base58.Encode(input)
-}
-
-func OldBase58Encode(input []byte) string {
-	const ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
-
-	x := new(big.Int).SetBytes(input)
-	base := big.NewInt(58)
-	zero := big.NewInt(0)
-	mod := &big.Int{}
-
-	var result []byte
-
-	for x.Cmp(zero) > 0 {
-		x.DivMod(x, base, mod)
-		result = append(result, ALPHABET[mod.Int64()])
-	}
-
-	// Add leading zeros
-	for _, b := range input {
-		if b == 0x00 {
-			result = append(result, ALPHABET[0])
-		} else {
-			break
-		}
-	}
-
-	// Reverse
-	for i, j := 0, len(result)-1; i < j; i, j = i+1, j-1 {
-		result[i], result[j] = result[j], result[i]
-	}
-
-	return string(result)
 }
 
 func saveProgressPeriodically(ctx context.Context, progress *Progress) {
