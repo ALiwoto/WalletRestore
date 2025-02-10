@@ -74,11 +74,20 @@ func main() {
 	fmt.Println("Using " + ssg.ToBase10(MaxGoroutines) + " Goroutines.")
 	fmt.Println("Please write as many words as you have (space-separated):")
 	knownWordsInput, _ := reader.ReadString('\n')
+	if knownWordsInput == "cancel" {
+		fmt.Println("Cancelling the operation as per user request")
+		return
+	}
+
 	knownWords := strings.Fields(strings.TrimSpace(knownWordsInput))
 
 	fmt.Println("Please give me the wallet address you would like to match:")
 	targetAddr, _ := reader.ReadString('\n')
 	targetAddr = strings.TrimSpace(targetAddr)
+	if targetAddr == "cancel" {
+		fmt.Println("Cancelling the operation as per user request")
+		return
+	}
 
 	if len(knownWords) == 12 {
 		mnemonic := strings.Join(knownWords, " ")
