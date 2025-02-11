@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"os/signal"
 	"strings"
@@ -15,17 +16,25 @@ import (
 	"sync/atomic"
 	"time"
 
+	"runtime"
+
 	"github.com/ALiwoto/ssg/ssg"
+	"github.com/btcsuite/btcd/btcutil/base58"
+	"github.com/btcsuite/btcd/btcutil/hdkeychain"
 	"github.com/btcsuite/btcd/chaincfg"
-	"github.com/btcsuite/btcutil/base58"
-	"github.com/btcsuite/btcutil/hdkeychain"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/tyler-smith/go-bip39"
 )
 
+func init() {
+	// Set it to use all available CPUs
+	runtime.GOMAXPROCS(runtime.NumCPU())
+}
+
 const (
-	SaveInterval         = 10 * time.Second
-	AllPositionsAreKnown = true
+	SaveInterval               = 10 * time.Second
+	AllPositionsAreKnown       = true
+	EstimateChecksPerGoroutine = 600
 )
 
 type Progress struct {
@@ -35,12 +44,26 @@ type Progress struct {
 	KnownPositions []int    `json:"known_positions"`
 }
 
+type WorkerInfo struct {
+	Ctx              context.Context
+	WorkersWaitGroup *sync.WaitGroup
+	WalletTargetAddr []byte
+	RestoreProgress  *Progress
+	WorkerId         int64
+	TotalJobs        int64
+	TotalGoroutines  int64
+}
+
 var (
-	NoProgress    = false
-	MaxGoroutines = 4 // Adjust based on your CPU
+	NoProgress        = false
+	MaxGoroutines     = 4 // Adjust based on your CPU
+	TotalWordsCount   = 12
+	TotalCombinations = int64(0)
 )
 
 func main() {
+	fmt.Printf("Number of CPUs available to us: %d\n", runtime.NumCPU())
+
 	for _, currentArg := range os.Args {
 		if currentArg == "--no-progress" {
 			NoProgress = true
@@ -134,58 +157,116 @@ func main() {
 	}
 
 	// Create work channel and wait group
-	jobs := make(chan []string, MaxGoroutines)
+	// jobs := make(chan []string, MaxGoroutines)
 	var wg sync.WaitGroup
 
 	fmt.Println("Start timestamp: " + ssg.ToBase10(time.Now().Unix()))
 
+	// Generate and test combinations
+	missingCount := TotalWordsCount - len(knownWords)
+	TotalCombinations = int64(math.Pow(float64(len(wordlist)), float64(missingCount)))
+	estimateChecksPerSeconds := int64(EstimateChecksPerGoroutine * MaxGoroutines)
+
+	fmt.Printf("Total combinations to test: %d\n", TotalCombinations)
+	fmt.Printf("Estimated time: %v (at "+
+		ssg.ToBase10(estimateChecksPerSeconds)+" checks/sec)\n",
+		time.Duration(TotalCombinations/estimateChecksPerSeconds)*time.Second,
+	)
+
 	// Start workers
 	for i := 0; i < MaxGoroutines; i++ {
 		wg.Add(1)
-		go worker(ctx, jobs, &wg, decodedTargetAddress, progress)
+		go worker(&WorkerInfo{
+			Ctx:              ctx,
+			WorkersWaitGroup: &wg,
+			WalletTargetAddr: decodedTargetAddress,
+			RestoreProgress:  progress,
+			WorkerId:         int64(i),
+			TotalJobs:        TotalCombinations,
+			TotalGoroutines:  int64(MaxGoroutines),
+		})
 	}
 
 	// Start progress saver
 	go saveProgressPeriodically(ctx, progress)
 
-	// Generate and test combinations
-	missingCount := 12 - len(knownWords)
-	totalCombinations := pow(len(wordlist), missingCount)
+	// generateCombinations(ctx, wordlist, progress, jobs)
 
-	fmt.Printf("Total combinations to test: %d\n", totalCombinations)
-	fmt.Printf("Estimated time: %v (at 2000 checks/sec)\n", time.Duration(totalCombinations/2000)*time.Second)
-
-	generateCombinations(ctx, wordlist, progress, jobs)
-
-	close(jobs)
+	// close(jobs)
 	wg.Wait()
 
 	fmt.Printf("\nTested %d combinations\n", atomic.LoadInt64(&progress.TestedCombos))
 	fmt.Println("Finish timestamp: " + ssg.ToBase10(time.Now().Unix()))
 }
 
-func worker(ctx context.Context, jobs <-chan []string, wg *sync.WaitGroup, targetAddr []byte, progress *Progress) {
-	defer wg.Add(-1)
+func worker(info *WorkerInfo) {
+	defer info.WorkersWaitGroup.Done()
 
-	for words := range jobs {
+	words := make([]string, TotalWordsCount)
+
+	// Fill known words
+	for i, word := range info.RestoreProgress.KnownWords {
+		words[info.RestoreProgress.KnownPositions[i]] = word
+	}
+
+	// Get positions that need to be filled
+	var missingPositions []int
+	for i := 0; i < TotalWordsCount; i++ {
+		if words[i] == "" {
+			missingPositions = append(missingPositions, i)
+		}
+	}
+
+	indices := make([]int, len(missingPositions))
+	var currentTestedCombos int
+	maxCurrentCombo := min(MaxGoroutines*100, 5000)
+
+	// Each worker calculates its own range of jobs
+	jobsPerWorker := info.TotalJobs / info.TotalGoroutines
+	startIndex := info.WorkerId * jobsPerWorker
+	endIndex := startIndex + jobsPerWorker
+
+	// Last worker takes any remaining jobs
+	if info.WorkerId == info.TotalJobs-1 {
+		endIndex = info.TotalJobs
+	}
+
+	// Process own range of jobs
+	for currentIndex := startIndex; currentIndex < endIndex; currentIndex++ {
 		select {
-		case <-ctx.Done():
+		case <-info.Ctx.Done():
 			return
 		default:
+			num := currentIndex
+			for j := len(indices) - 1; j >= 0; j-- {
+				indices[j] = int(num) % len(bip39.GetWordList())
+				num /= int64(len(bip39.GetWordList()))
+			}
+
+			// Fill missing positions with words
+			for j, pos := range missingPositions {
+				words[pos] = bip39.GetWordList()[indices[j]]
+			}
+
 			if !containsRepeated(words) {
-				if address, ok := checkWallet(strings.Join(words, " "), targetAddr); ok {
+				if address, ok := checkWallet(strings.Join(words, " "), info.WalletTargetAddr); ok {
 					fmt.Printf("\nFOUND MATCH!\nAddress: %s\nWords: %s\n", base58.Encode(address), strings.Join(words, " "))
 					fmt.Println("Finish timestamp: " + ssg.ToBase10(time.Now().Unix()))
 					os.Exit(0)
 				}
 			}
-			atomic.AddInt64(&progress.TestedCombos, 1)
+
+			currentTestedCombos++
+			if (currentTestedCombos % maxCurrentCombo) == 0 {
+				atomic.AddInt64(&info.RestoreProgress.TestedCombos, int64(currentTestedCombos))
+				currentTestedCombos = 0
+			}
 		}
 	}
 }
 
-func generateCombinations(ctx context.Context, wordlist []string, progress *Progress, jobs chan<- []string) {
-	words := make([]string, 12)
+func OldGenerateCombinations(ctx context.Context, wordlist []string, progress *Progress, jobs chan<- []string) {
+	words := make([]string, TotalWordsCount)
 
 	// Fill known words
 	for i, word := range progress.KnownWords {
@@ -194,7 +275,7 @@ func generateCombinations(ctx context.Context, wordlist []string, progress *Prog
 
 	// Get positions that need to be filled
 	var missingPositions []int
-	for i := 0; i < 12; i++ {
+	for i := 0; i < TotalWordsCount; i++ {
 		if words[i] == "" {
 			missingPositions = append(missingPositions, i)
 		}
@@ -203,9 +284,8 @@ func generateCombinations(ctx context.Context, wordlist []string, progress *Prog
 	// Generate combinations
 	indices := make([]int, len(missingPositions))
 	startIndex := progress.LastIndex + 1
-	maxTries := pow(len(wordlist), len(missingPositions))
 
-	for i := startIndex; i < maxTries; i++ {
+	for i := startIndex; i < TotalCombinations; i++ {
 		select {
 		case <-ctx.Done():
 			return
@@ -223,7 +303,7 @@ func generateCombinations(ctx context.Context, wordlist []string, progress *Prog
 			}
 
 			// Make copy of words slice
-			wordsCopy := make([]string, 12)
+			wordsCopy := make([]string, TotalWordsCount)
 			copy(wordsCopy, words)
 
 			jobs <- wordsCopy
@@ -333,14 +413,6 @@ func loadProgress() *Progress {
 		return nil
 	}
 	return &progress
-}
-
-func pow(x, y int) int64 {
-	result := int64(1)
-	for i := 0; i < y; i++ {
-		result *= int64(x)
-	}
-	return result
 }
 
 func containsRepeated(words []string) bool {
